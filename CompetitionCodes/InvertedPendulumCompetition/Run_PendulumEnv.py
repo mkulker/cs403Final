@@ -274,14 +274,13 @@ def _physics_loop(simulate: _Simulate, loader: Optional[_InternalLoaderType]):
                     pend_ctrl.CtrlUpdate()
                     pushing_trial_gap = 4.0
                     pushing_duration = 0.1
-                    
+                    pend_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "pendulum")  # Ensure correct object type
                     if(next_pushing_time < d.time and d.time < next_pushing_time + pushing_duration/2):
-                        pend_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "pendulum")  # Ensure correct object type
+                        
                         force[1] = push_force
                         mujoco.mj_applyFT(m, d, force, torque, point, pend_id, d.qfrc_applied)
 
                     if(next_pushing_time + pushing_duration/2 < d.time and d.time < next_pushing_time + pushing_duration):
-                        pend_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "pendulum")  # Ensure correct object type
                         force[1] = -push_force
                         mujoco.mj_applyFT(m, d, force, torque, point, pend_id, d.qfrc_applied)
                     
@@ -293,7 +292,18 @@ def _physics_loop(simulate: _Simulate, loader: Optional[_InternalLoaderType]):
                         print("Next Pushing Force: ", push_force)
  
                     # if joint positions are out of range, exit simulation
-                    if np.any(np.abs(d.qpos[6]) > np.pi/1.2):
+                    # if np.any(np.abs(d.qpos[6]) > np.pi/1.2):
+                    #     print("Final Balance Count: ", balance_count)
+                    #     exit(0)
+
+                    quat = d.body(pend_id).xquat
+                    R_flat = np.empty(9, dtype=np.float64)
+                    mujoco._functions.mju_quat2Mat(R_flat, quat)
+                    R = R_flat.reshape(3, 3)
+                    # The local z-axis in world coordinates is the third column of the rotation matrix.
+                    local_z = R[:, 2]
+
+                    if local_z[2] < 0:
                         print("Final Balance Count: ", balance_count)
                         exit(0)
 
