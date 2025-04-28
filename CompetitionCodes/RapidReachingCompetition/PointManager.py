@@ -80,4 +80,3 @@ class PointHandle:
         if not self._check_point_reached():
             self.d.ctrl[:6] = 0  # Stop the robot
             return
-
