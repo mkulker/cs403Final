@@ -2,22 +2,26 @@ import numpy as np
 import mujoco
 
 class YourCtrl:
-    def __init__(self, model, data, target_points, Kp=200.0, Kd=20.0, threshold=0.05):
+    def __init__(self, model, data, target_points, Kp=400.0, Kd=40.0, threshold=0.01, Kc=100.0):
         """
-        Simplified PD controller in operational space (Jacobian-transpose) to touch each point.
+        PD controller in task space with decaying constant push for smooth, precise reaching.
 
         :param model: MuJoCo MjModel
         :param data: MuJoCo MjData
-        :param target_points: (3,N) array or list of [x,y,z] points
+        :param target_points: (3,N) array or list of [x,y,z]
         :param Kp: Task-space proportional gain
-        :param Kd: Joint-space derivative gain
-        :param threshold: Distance threshold to switch points
+        :param Kd: Joint-space derivative (damping) gain
+        :param threshold: Distance threshold (m) to consider target reached
+        :param Kc: Maximum constant task-space push gain
         """
         self.model = model
         self.data = data
-        self.threshold = threshold  # meters
-        self.Kp_task = Kp
+        # Switching tolerance for reaching target exactly
+        self.threshold = threshold
+        self.Kp = Kp
         self.Kd = Kd
+        self.Kc = Kc
+        # End-effector body id (6th joint)
         self.eef_body = model.jnt_bodyid[5]
         # Load targets as list of (3,) arrays
         if isinstance(target_points, np.ndarray) and target_points.ndim == 2 and target_points.shape[0] == 3:
@@ -26,35 +30,105 @@ class YourCtrl:
         else:
             self.targets = [np.array(pt, dtype=float) for pt in target_points]
         self.index = 0
+        # Jacobian buffer
         self.jacp = np.zeros((3, model.nv))
-        print(f"Controller initialized with {len(self.targets)} targets, threshold={self.threshold}")
+        print(f"Controller init: {len(self.targets)} targets, threshold={self.threshold}")
 
     def CtrlUpdate(self):
         """
-        Apply Jacobian-transpose PD in task space to move EE to current target.
+        Called each timestep to compute control torques.
+        Terminates (zeros) after final target.
         """
+        # Zero control if done
+        if self.index >= len(self.targets):
+            self.data.ctrl[:6] = np.zeros(6)
+            return self.data.ctrl.copy()
+
         mujoco.mj_forward(self.model, self.data)
         ee_pos = self.data.xpos[self.eef_body].ravel()
         tgt = self.targets[self.index]
         err = tgt - ee_pos
         dist = np.linalg.norm(err)
-        # Switch to next target if within threshold
+
+        # Switch when error below threshold
         if dist < self.threshold:
-            print(f"Reached target {self.index} at dist {dist:.3f}")
+            print(f"Reached target {self.index} at dist={dist:.4f}")
             self.index += 1
-            if self.index < len(self.targets):
-                print(f"Switching to target {self.index}: {self.targets[self.index]}")
-                tgt = self.targets[self.index]
-                err = tgt - ee_pos
-            else:
-                print("All targets reached. Holding final position.")
-                self.index = len(self.targets) - 1
-                err = np.zeros_like(err)
-        # Compute Jacobian and PD torque
+            if self.index >= len(self.targets):
+                print("All targets reached. Terminating control.")
+                self.data.ctrl[:6] = np.zeros(6)
+                return self.data.ctrl.copy()
+            print(f"Switching to target {self.index}")
+            tgt = self.targets[self.index]
+            err = tgt - ee_pos
+            dist = np.linalg.norm(err)
+
+        # Compute Jacobian
         mujoco.mj_jacBody(self.model, self.data, self.jacp, None, self.eef_body)
         J = self.jacp[:, :6]
-        tau_task = J.T.dot(self.Kp_task * err)
+        # Unit direction
+        if dist > 1e-8:
+            dir_unit = err / dist
+        else:
+            dir_unit = np.zeros(3)
+        # Decaying constant push: scales from max Kc at far distances down to 0 at threshold
+        push_scale = min(dist / self.threshold, 1.0)
+        force = self.Kp * err + self.Kc * push_scale * dir_unit
+        # Joint torques via J^T
+        tau_task = J.T.dot(force)
+        # Damping
         tau_damp = -self.Kd * self.data.qvel[:6]
         ctrl = tau_task + tau_damp
+        self.data.ctrl[:6] = ctrl
+        return self.data.ctrl.copy()
+
+# End of YourCtrl class(self):
+        """
+        Called each timestep to compute control torques.
+        Terminates (zero torques) after final target.
+        """
+        # If all targets reached, zero out controls and return
+        if self.index >= len(self.targets):
+            self.data.ctrl[:6] = np.zeros(6)
+            return self.data.ctrl.copy()
+
+        # Forward kinematics for current state
+        mujoco.mj_forward(self.model, self.data)
+        ee_pos = self.data.xpos[self.eef_body].ravel()
+        # Compute error to current target
+        tgt = self.targets[self.index]
+        err = tgt - ee_pos
+        dist = np.linalg.norm(err)
+        # Check if reached current target
+        if dist < self.threshold:
+            print(f"Reached target {self.index} at distance {dist:.3f}")
+            self.index += 1
+            # Move to next target or hold
+            if self.index < len(self.targets):
+                print(f"Switching to target {self.index}")
+                tgt = self.targets[self.index]
+                err = tgt - ee_pos
+                dist = np.linalg.norm(err)
+            else:
+                print("All targets reached. Terminating control.")
+                self.data.ctrl[:6] = np.zeros(6)
+                return self.data.ctrl.copy()
+
+        # Compute position Jacobian (3 x nv)
+        mujoco.mj_jacBody(self.model, self.data, self.jacp, None, self.eef_body)
+        J = self.jacp[:, :6]
+        # Direction unit vector for constant push
+        if dist > 1e-6:
+            dir_unit = err / dist
+        else:
+            dir_unit = np.zeros(3)
+        # Task-space force: P*err + C*dir_unit
+        force = self.Kp * err + self.Kc * dir_unit
+        # Map to joint torques via Jacobian-transpose
+        tau_task = J.T.dot(force)
+        # Joint-space damping
+        tau_damp = -self.Kd * self.data.qvel[:6]
+        ctrl = tau_task + tau_damp
+        # Apply to first 6 actuators
         self.data.ctrl[:6] = ctrl
         return self.data.ctrl.copy()
