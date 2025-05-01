@@ -2,7 +2,7 @@ import numpy as np
 import mujoco
 
 class YourCtrl:
-    def __init__(self, model, data, target_points, Kp=400.0, Kd=40.0, threshold=0.01, Kc=100.0):
+    def __init__(self, model, data, target_points, Kp=495.0, Kd=40.0, threshold=0.006, Kc=220.0):
         """
         PD controller in task space with decaying constant push for smooth, precise reaching.
 
@@ -30,6 +30,8 @@ class YourCtrl:
         else:
             self.targets = [np.array(pt, dtype=float) for pt in target_points]
         self.index = 0
+        # Reorder targets: start from initial EE pose, then greedy nearest neighbor
+        self.targets = self._plan_path_order()
         # Jacobian buffer
         self.jacp = np.zeros((3, model.nv))
         print(f"Controller init: {len(self.targets)} targets, threshold={self.threshold}")
@@ -81,4 +83,47 @@ class YourCtrl:
         ctrl = tau_task + tau_damp
         self.data.ctrl[:6] = ctrl
         return self.data.ctrl.copy()
+
+    def _plan_path_order(self):
+        """Plan target order by BFS over k-nearest neighbor graph from initial EE position."""
+        from collections import deque
+        # initial EE pose
+        mujoco.mj_forward(self.model, self.data)
+        ee_pos = self.data.xpos[self.eef_body].ravel().copy()
+        pts = [pt.copy() for pt in self.targets]
+        N = len(pts)
+        if N == 0:
+            return []
+        # root: closest to EE
+        d0 = [np.linalg.norm(pt - ee_pos) for pt in pts]
+        root = int(np.argmin(d0))
+        visited = {root}
+        order = [pts[root]]
+        # build k-NN graph
+        K = min(3, N-1)
+        dmat = [[0]*N for _ in range(N)]
+        for i in range(N):
+            for j in range(N):
+                dmat[i][j] = np.linalg.norm(pts[i]-pts[j]) if i!=j else float('inf')
+        adj = {i: sorted(range(N), key=lambda j: dmat[i][j])[:K] for i in range(N)}
+        # BFS traversal
+        q = deque([root])
+        while q and len(visited) < N:
+            u = q.popleft()
+            for v in adj[u]:
+                if v not in visited:
+                    visited.add(v)
+                    order.append(pts[v])
+                    q.append(v)
+        # Append any missing points via greedy nearest neighbor from last reached
+        if len(order) < N:
+            rem_idx = [i for i in range(N) if i not in visited]
+            current_pt = order[-1]
+            while rem_idx:
+                dists2 = [np.linalg.norm(pts[i] - current_pt) for i in rem_idx]
+                j = int(np.argmin(dists2))
+                idx2 = rem_idx.pop(j)
+                order.append(pts[idx2])
+                current_pt = pts[idx2]
+        return order
 
